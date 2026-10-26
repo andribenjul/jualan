@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# Zabbix 6.0 + MySQL 8 + Apache on Ubuntu 20.04
+#
+# Usage:
+#   sudo bash install-zabbix6-ubuntu2004.sh
+#   sudo DB_PASS='Passw0rdLab' PHP_TZ='Asia/Jakarta' bash install-zabbix6-ubuntu2004.sh
+#
+# Default DB password is random and printed at the end.
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+
+DB_NAME="${DB_NAME:-zabbix}"
+DB_USER="${DB_USER:-zabbix}"
+DB_PASS="${DB_PASS:-$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)}"
+PHP_TZ="${PHP_TZ:-Asia/Jakarta}"
+
+ZBX_REL="zabbix-release_latest_6.0+ubuntu20.04_all.deb"
+ZBX_URL="https://repo.zabbix.com/zabbix/6.0/ubuntu/pool/main/z/zabbix-release/${ZBX_REL}"
+
+log() { printf '\n[*] %s\n' "$*"; }
+die() { printf '\n[!] %s\n' "$*" >&2; exit 1; }
+
+[ "$(id -u)" -eq 0 ] || die "Jalankan sebagai root: sudo bash $0"
+
+. /etc/os-release
+if [ "${ID:-}" != "ubuntu" ] || [ "${VERSION_ID:-}" != "20.04" ]; then
+  die "Script ini untuk Ubuntu 20.04. Terdeteksi: ${PRETTY_NAME:-unknown}"
+fi
+
+log "Update apt dan install prerequisite"
+apt-get update
+apt-get install -y wget curl ca-certificates gnupg lsb-release
+
+log "Tambah repo Zabbix 6.0"
+cd /tmp
+wget -q "$ZBX_URL" -O zabbix-release.deb
+dpkg -i zabbix-release.deb
+apt-get update
+
+log "Install MySQL, Zabbix server, frontend, agent"
+apt-get install -y mysql-server zabbix-server-mysql zabbix-frontend-php \
+  zabbix-apache-conf zabbix-sql-scripts zabbix-agent
+
+log "Aktifkan MySQL"
+systemctl enable --now mysql
+
+# Root MySQL di Ubuntu 20.04 default-nya auth_socket.
+# Kalau root sudah diberi password, set MYSQL_ROOT_PASS.
+MYSQL=(mysql)
+if [ -n "${MYSQL_ROOT_PASS:-}" ]; then
+  MYSQL=(mysql -uroot -p"${MYSQL_ROOT_PASS}")
+fi
+
+for i in $(seq 1 30); do
+  if "${MYSQL[@]}" -e 'SELECT 1' >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+  [ "$i" -eq 30 ] && die "MySQL tidak siap. Cek: systemctl status mysql"
+done
+
+log "Buat database dan user Zabbix"
+"${MYSQL[@]}" <<SQL
+CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
+CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
+ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';
+SET GLOBAL log_bin_trust_function_creators = 1;
+FLUSH PRIVILEGES;
+SQL
+
+log "Import schema Zabbix (1-3 menit)"
+TABLES=$("${MYSQL[@]}" -N -B -e \
+  "SELECT COUNT(*) FROM information_schema.tables
+   WHERE table_schema='${DB_NAME}' AND table_name='users';")
+
+if [ "${TABLES}" -eq 0 ]; then
+  zcat /usr/share/zabbix-sql-scripts/mysql/server.sql.gz \
+    | MYSQL_PWD="${DB_PASS}" mysql --default-character-set=utf8mb4 \
+        -u"${DB_USER}" "${DB_NAME}"
+else
+  echo "Schema sudah ada, skip import."
+fi
+
+"${MYSQL[@]}" -e "SET GLOBAL log_bin_trust_function_creators = 0;" || true
+
+log "Konfigurasi zabbix_server.conf"
+CONF=/etc/zabbix/zabbix_server.conf
+cp -n "$CONF" "${CONF}.bak.$(date +%s)" 2>/dev/null || true
+
+sed -i '/^DBPassword=/d' "$CONF"
+printf 'DBPassword=%s\n' "$DB_PASS" >> "$CONF"
+
+for kv in "DBName=${DB_NAME}" "DBUser=${DB_USER}" "DBHost=localhost"; do
+  k="${kv%%=*}"
+  v="${kv#*=}"
+  if grep -q "^${k}=" "$CONF"; then
+    sed -i "s|^${k}=.*|${k}=${v}|" "$CONF"
+  else
+    echo "${k}=${v}" >> "$CONF"
+  fi
+done
+
+log "Set timezone PHP + aktifkan config Apache"
+APCONF=/etc/apache2/conf-available/zabbix.conf
+if [ -f "$APCONF" ]; then
+  sed -i "s|^[[:space:]]*php_value[[:space:]]\+date.timezone.*|php_value date.timezone ${PHP_TZ}|" "$APCONF"
+  a2enconf zabbix >/dev/null 2>&1 || true
+fi
+a2enmod rewrite >/dev/null 2>&1 || true
+
+log "Enable dan restart service"
+systemctl enable zabbix-server zabbix-agent apache2
+systemctl restart apache2
+systemctl restart zabbix-agent || true
+systemctl restart zabbix-server || true
+
+sleep 2
+if ! systemctl is-active --quiet zabbix-server; then
+  echo "[!] zabbix-server gagal start. Log terakhir:" >&2
+  journalctl -u zabbix-server -n 40 --no-pager || true
+  exit 1
+fi
+
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
+  ufw allow 80/tcp >/dev/null 2>&1 || true
+  ufw allow 10050/tcp >/dev/null 2>&1 || true
+fi
+
+IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+cat <<EOF
+
+============================================================
+ Zabbix 6.0 terpasang
+ Web        : http://${IP:-<ip-node>}/zabbix
+ Login      : Admin / zabbix
+ DB         : ${DB_NAME} / ${DB_USER}
+ DB password: ${DB_PASS}
+ Server cfg : ${CONF}
+============================================================
+ Buka URL di atas, selesaikan wizard frontend sekali,
+ lalu ganti password Admin.
+EOF
